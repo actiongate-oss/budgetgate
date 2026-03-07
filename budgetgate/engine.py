@@ -17,6 +17,7 @@ from .core import (
     Status,
     StoreErrorMode,
 )
+from .emitter import Emitter
 from .store import MemoryStore, Store
 
 P = ParamSpec("P")
@@ -32,230 +33,105 @@ class BudgetExceeded(RuntimeError):
 
 
 class Engine:
-    """BudgetGate engine for spend limiting agent actions.
-    
-    BudgetGate enforces economic constraints before action execution.
-    It supports two modes:
-    
-    1. Fixed cost (truly pre-execution):
-       Cost is known before execution. Atomic check-and-reserve.
-       
-    2. Bounded dynamic cost (pre-execution with estimate):
-       Cost is known only after execution, but bounded by estimate.
-       Reserves estimate, commits actual, releases difference.
-    
-    Example:
-        engine = Engine()
-        
-        # Fixed cost - known before execution
-        @engine.guard(
-            Ledger("openai", "embedding"),
-            Budget(max_spend=Decimal("10.00"), window=3600),
-            cost=Decimal("0.0001"),
-        )
-        def embed(text: str) -> list[float]:
-            return openai.embed(text)
-        
-        # Bounded dynamic cost - estimate before, actual after
-        @engine.guard_bounded(
-            Ledger("openai", "gpt-4"),
-            Budget(max_spend=Decimal("50.00"), window=3600),
-            estimate=Decimal("0.50"),  # Max possible cost
-            actual=lambda r: Decimal(str(r.usage.total_cost)),
-        )
-        def chat(prompt: str) -> Response:
-            return openai.chat(prompt)
-    """
+    """BudgetGate engine for spend limiting agent actions."""
 
-    __slots__ = ("_store", "_clock", "_budgets", "_listeners", "_errors")
+    __slots__ = ("_store", "_clock", "_budgets", "_emitter")
 
     def __init__(
         self,
         store: Store | None = None,
         clock: Callable[[], float] | None = None,
+        emitter: Emitter | None = None,
     ) -> None:
         self._store: Store = store or MemoryStore()
         self._clock = clock or time.monotonic
         self._budgets: dict[Ledger, Budget] = {}
-        self._listeners: list[Callable[[Decision], None]] = []
-        self._errors = 0
+        self._emitter = emitter or Emitter()
 
     # ─────────────────────────────────────────────────────────────
     # Configuration
     # ─────────────────────────────────────────────────────────────
 
     def register(self, ledger: Ledger, budget: Budget) -> None:
-        """Register a budget for a ledger."""
         self._budgets[ledger] = budget
 
     def budget_for(self, ledger: Ledger) -> Budget:
-        """Get budget for ledger (default infinite if not registered)."""
-        return self._budgets.get(
-            ledger,
-            Budget(max_spend=Decimal("Infinity")),
-        )
+        return self._budgets.get(ledger, Budget(max_spend=Decimal("Infinity")))
 
     def on_decision(self, listener: Callable[[Decision], None]) -> None:
-        """Add a listener for decisions (for logging/metrics)."""
-        self._listeners.append(listener)
+        self._emitter.add(listener)
 
     @property
     def listener_errors(self) -> int:
-        """Count of listener exceptions (never block execution)."""
-        return self._errors
+        return self._emitter.error_count
 
     # ─────────────────────────────────────────────────────────────
     # Core API
     # ─────────────────────────────────────────────────────────────
 
-    def check(
-        self,
-        ledger: Ledger,
-        amount: Decimal,
-        budget: Budget | None = None,
-    ) -> Decision:
-        """Check if spend is allowed and reserve if so.
-        
-        This is atomic: if ALLOW is returned, the spend is already reserved.
-        """
+    def check(self, ledger: Ledger, amount: Decimal, budget: Budget | None = None) -> Decision:
         now = self._clock()
         budget = budget or self.budget_for(ledger)
-
         try:
-            total_spent, allowed = self._store.check_and_reserve(
-                ledger, now, amount, budget
-            )
+            total_spent, allowed = self._store.check_and_reserve(ledger, now, amount, budget)
         except Exception as e:
             return self._handle_store_error(ledger, budget, amount, e)
-
         if allowed:
             remaining = max(Decimal("0"), budget.max_spend - total_spent)
-            return self._decide(
-                ledger,
-                budget,
-                amount,
-                status=Status.ALLOW,
-                spent_in_window=total_spent,
-                remaining=remaining,
-            )
-
+            return self._decide(ledger, budget, amount, status=Status.ALLOW,
+                                spent_in_window=total_spent, remaining=remaining)
         remaining = max(Decimal("0"), budget.max_spend - total_spent)
-        return self._decide(
-            ledger,
-            budget,
-            amount,
-            status=Status.BLOCK,
-            reason=BlockReason.BUDGET_EXCEEDED,
-            message=f"Budget exceeded: {total_spent} + {amount} > {budget.max_spend}",
-            spent_in_window=total_spent,
-            remaining=remaining,
-        )
+        return self._decide(ledger, budget, amount, status=Status.BLOCK,
+                            reason=BlockReason.BUDGET_EXCEEDED,
+                            message=f"Budget exceeded: {total_spent} + {amount} > {budget.max_spend}",
+                            spent_in_window=total_spent, remaining=remaining)
 
-    def reserve(
-        self,
-        ledger: Ledger,
-        estimate: Decimal,
-        budget: Budget | None = None,
-    ) -> tuple[str | None, Decision]:
-        """Reserve spend without committing.
-        
-        Used for bounded dynamic costs.
-        
-        Returns:
-            (reservation_id, decision)
-            reservation_id is None if blocked.
-        """
+    def reserve(self, ledger: Ledger, estimate: Decimal, budget: Budget | None = None) -> tuple[str | None, Decision]:
         now = self._clock()
         budget = budget or self.budget_for(ledger)
-
         try:
             res_id, total_spent = self._store.reserve(ledger, now, estimate, budget)
         except Exception as e:
             return None, self._handle_store_error(ledger, budget, estimate, e)
-
         if res_id is not None:
             remaining = max(Decimal("0"), budget.max_spend - total_spent)
-            decision = self._decide(
-                ledger,
-                budget,
-                estimate,
-                status=Status.ALLOW,
-                spent_in_window=total_spent,
-                remaining=remaining,
-            )
-            return res_id, decision
-
+            return res_id, self._decide(ledger, budget, estimate, status=Status.ALLOW,
+                                        spent_in_window=total_spent, remaining=remaining)
         remaining = max(Decimal("0"), budget.max_spend - total_spent)
-        decision = self._decide(
-            ledger,
-            budget,
-            estimate,
-            status=Status.BLOCK,
-            reason=BlockReason.BUDGET_EXCEEDED,
-            message=f"Budget exceeded: {total_spent} + {estimate} > {budget.max_spend}",
-            spent_in_window=total_spent,
-            remaining=remaining,
-        )
-        return None, decision
+        return None, self._decide(ledger, budget, estimate, status=Status.BLOCK,
+                                  reason=BlockReason.BUDGET_EXCEEDED,
+                                  message=f"Budget exceeded: {total_spent} + {estimate} > {budget.max_spend}",
+                                  spent_in_window=total_spent, remaining=remaining)
 
     def commit(self, reservation_id: str, actual: Decimal) -> None:
-        """Commit a reservation with actual spend."""
         self._store.commit(reservation_id, actual)
 
     def release(self, reservation_id: str) -> None:
-        """Release a reservation without committing (e.g., on failure)."""
         self._store.release(reservation_id)
 
     def enforce(self, decision: Decision) -> None:
-        """Raise BudgetExceeded if decision is blocked in HARD mode."""
         if decision.blocked and decision.budget.mode == Mode.HARD:
             raise BudgetExceeded(decision)
 
     def get_remaining(self, ledger: Ledger, budget: Budget | None = None) -> Decimal:
-        """Get remaining budget (read-only, no reservation)."""
         now = self._clock()
         budget = budget or self.budget_for(ledger)
         spent = self._store.get_spend(ledger, now, budget.window)
         return max(Decimal("0"), budget.max_spend - spent)
 
     def clear(self, ledger: Ledger) -> None:
-        """Clear spend history for a ledger."""
         self._store.clear(ledger)
 
     def clear_all(self) -> None:
-        """Clear all spend history."""
         self._store.clear_all()
 
     # ─────────────────────────────────────────────────────────────
     # Decorator API
     # ─────────────────────────────────────────────────────────────
 
-    def guard(
-        self,
-        ledger: Ledger,
-        budget: Budget | None = None,
-        *,
-        cost: Decimal,
-    ) -> Callable[[Callable[P, T]], Callable[P, T]]:
-        """Decorator for fixed-cost actions (truly pre-execution).
-        
-        Cost must be known before execution. Atomic check-and-reserve.
-        
-        - HARD mode (default): raises BudgetExceeded on block
-        - SOFT mode: raises BudgetExceeded on block (use guard_result for no-raise)
-        
-        Example:
-            @engine.guard(
-                Ledger("openai", "embedding"),
-                Budget(max_spend=Decimal("10.00")),
-                cost=Decimal("0.0001"),
-            )
-            def embed(text: str) -> list[float]:
-                return openai.embed(text)
-        """
+    def guard(self, ledger: Ledger, budget: Budget | None = None, *, cost: Decimal) -> Callable[[Callable[P, T]], Callable[P, T]]:
         if budget is not None:
             self.register(ledger, budget)
-
         def decorator(fn: Callable[P, T]) -> Callable[P, T]:
             @wraps(fn)
             def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
@@ -263,48 +139,18 @@ class Engine:
                 if decision.blocked:
                     raise BudgetExceeded(decision)
                 return fn(*args, **kwargs)
-
             return wrapper
-
         return decorator
 
-    def guard_bounded(
-        self,
-        ledger: Ledger,
-        budget: Budget | None = None,
-        *,
-        estimate: Decimal,
-        actual: Callable[[T], Decimal],
-    ) -> Callable[[Callable[P, T]], Callable[P, T]]:
-        """Decorator for bounded dynamic-cost actions.
-        
-        Reserves `estimate` before execution, commits `actual(result)` after.
-        This is still pre-execution gating: if estimate doesn't fit, action is blocked.
-        
-        - HARD mode (default): raises BudgetExceeded on block
-        - SOFT mode: raises BudgetExceeded on block (use guard_bounded_result for no-raise)
-        
-        Example:
-            @engine.guard_bounded(
-                Ledger("openai", "gpt-4"),
-                Budget(max_spend=Decimal("50.00")),
-                estimate=Decimal("0.50"),
-                actual=lambda r: Decimal(str(r.usage.total_cost)),
-            )
-            def chat(prompt: str) -> Response:
-                return openai.chat(prompt)
-        """
+    def guard_bounded(self, ledger: Ledger, budget: Budget | None = None, *, estimate: Decimal, actual: Callable[[T], Decimal]) -> Callable[[Callable[P, T]], Callable[P, T]]:
         if budget is not None:
             self.register(ledger, budget)
-
         def decorator(fn: Callable[P, T]) -> Callable[P, T]:
             @wraps(fn)
             def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
                 res_id, decision = self.reserve(ledger, estimate)
-
                 if decision.blocked:
                     raise BudgetExceeded(decision)
-
                 try:
                     result = fn(*args, **kwargs)
                     actual_cost = actual(result)
@@ -316,85 +162,32 @@ class Engine:
                     if res_id is not None:
                         self.release(res_id)
                     raise
-
             return wrapper
-
         return decorator
 
-    def guard_result(
-        self,
-        ledger: Ledger,
-        budget: Budget | None = None,
-        *,
-        cost: Decimal,
-    ) -> Callable[[Callable[P, T]], Callable[P, Result[T]]]:
-        """Decorator for fixed-cost actions that returns Result[T] (never raises).
-        
-        Example:
-            @engine.guard_result(
-                Ledger("openai", "embedding"),
-                Budget(max_spend=Decimal("10.00"), mode=Mode.SOFT),
-                cost=Decimal("0.0001"),
-            )
-            def embed(text: str) -> list[float]:
-                return openai.embed(text)
-            
-            result = embed("hello")
-            if result.ok:
-                vectors = result.unwrap()
-        """
+    def guard_result(self, ledger: Ledger, budget: Budget | None = None, *, cost: Decimal) -> Callable[[Callable[P, T]], Callable[P, Result[T]]]:
         if budget is not None:
             self.register(ledger, budget)
-
         def decorator(fn: Callable[P, T]) -> Callable[P, Result[T]]:
             @wraps(fn)
             def wrapper(*args: P.args, **kwargs: P.kwargs) -> Result[T]:
                 decision = self.check(ledger, cost)
-
                 if decision.blocked:
                     return Result(decision=decision)
-
                 value = fn(*args, **kwargs)
                 return Result(decision=decision, _value=value)
-
             return wrapper
-
         return decorator
 
-    def guard_bounded_result(
-        self,
-        ledger: Ledger,
-        budget: Budget | None = None,
-        *,
-        estimate: Decimal,
-        actual: Callable[[T], Decimal],
-    ) -> Callable[[Callable[P, T]], Callable[P, Result[T]]]:
-        """Decorator for bounded dynamic-cost actions that returns Result[T] (never raises).
-        
-        Example:
-            @engine.guard_bounded_result(
-                Ledger("openai", "gpt-4"),
-                Budget(max_spend=Decimal("50.00"), mode=Mode.SOFT),
-                estimate=Decimal("0.50"),
-                actual=lambda r: Decimal(str(r.usage.total_cost)),
-            )
-            def chat(prompt: str) -> Response:
-                return openai.chat(prompt)
-            
-            result = chat("hello")
-            response = result.unwrap_or(fallback_response)
-        """
+    def guard_bounded_result(self, ledger: Ledger, budget: Budget | None = None, *, estimate: Decimal, actual: Callable[[T], Decimal]) -> Callable[[Callable[P, T]], Callable[P, Result[T]]]:
         if budget is not None:
             self.register(ledger, budget)
-
         def decorator(fn: Callable[P, T]) -> Callable[P, Result[T]]:
             @wraps(fn)
             def wrapper(*args: P.args, **kwargs: P.kwargs) -> Result[T]:
                 res_id, decision = self.reserve(ledger, estimate)
-
                 if decision.blocked:
                     return Result(decision=decision)
-
                 try:
                     result = fn(*args, **kwargs)
                     actual_cost = actual(result)
@@ -404,70 +197,26 @@ class Engine:
                     if res_id is not None:
                         self.release(res_id)
                     raise
-
             return wrapper
-
         return decorator
 
     # ─────────────────────────────────────────────────────────────
     # Internal
     # ─────────────────────────────────────────────────────────────
 
-    def _handle_store_error(
-        self,
-        ledger: Ledger,
-        budget: Budget,
-        amount: Decimal,
-        error: Exception,
-    ) -> Decision:
-        """Handle store errors according to policy."""
+    def _handle_store_error(self, ledger: Ledger, budget: Budget, amount: Decimal, error: Exception) -> Decision:
         if budget.on_store_error == StoreErrorMode.FAIL_OPEN:
-            return self._decide(
-                ledger,
-                budget,
-                amount,
-                status=Status.ALLOW,
-                reason=BlockReason.STORE_ERROR,
-                message=f"Store error (fail-open): {error}",
-            )
+            return self._decide(ledger, budget, amount, status=Status.ALLOW,
+                                reason=BlockReason.STORE_ERROR, message=f"Store error (fail-open): {error}")
         else:
-            return self._decide(
-                ledger,
-                budget,
-                amount,
-                status=Status.BLOCK,
-                reason=BlockReason.STORE_ERROR,
-                message=f"Store error (fail-closed): {error}",
-            )
+            return self._decide(ledger, budget, amount, status=Status.BLOCK,
+                                reason=BlockReason.STORE_ERROR, message=f"Store error (fail-closed): {error}")
 
-    def _decide(
-        self,
-        ledger: Ledger,
-        budget: Budget,
-        amount: Decimal,
-        *,
-        status: Status,
-        reason: BlockReason | None = None,
-        message: str | None = None,
-        spent_in_window: Decimal = Decimal("0"),
-        remaining: Decimal = Decimal("0"),
-    ) -> Decision:
-        decision = Decision(
-            status=status,
-            ledger=ledger,
-            budget=budget,
-            reason=reason,
-            message=message,
-            spent_in_window=spent_in_window,
-            requested=amount,
-            remaining=remaining,
-        )
-        self._emit(decision)
+    def _decide(self, ledger: Ledger, budget: Budget, amount: Decimal, *, status: Status,
+                reason: BlockReason | None = None, message: str | None = None,
+                spent_in_window: Decimal = Decimal("0"), remaining: Decimal = Decimal("0")) -> Decision:
+        decision = Decision(status=status, ledger=ledger, budget=budget, reason=reason,
+                            message=message, spent_in_window=spent_in_window,
+                            requested=amount, remaining=remaining)
+        self._emitter.emit(decision)
         return decision
-
-    def _emit(self, decision: Decision) -> None:
-        for listener in self._listeners:
-            try:
-                listener(decision)
-            except Exception:
-                self._errors += 1

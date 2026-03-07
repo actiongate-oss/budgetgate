@@ -15,6 +15,7 @@ from .core import (
     Status,
     StoreErrorMode,
 )
+from .emitter import Emitter
 from .engine import BudgetExceeded, Engine
 from .store import MemoryStore, Reservation, SpendEvent, Store
 
@@ -33,6 +34,7 @@ __all__ = [
     # Engine
     "Engine",
     "BudgetExceeded",
+    "Emitter",
     # Store
     "Store",
     "MemoryStore",
@@ -40,4 +42,4 @@ __all__ = [
     "Reservation",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.2.2"

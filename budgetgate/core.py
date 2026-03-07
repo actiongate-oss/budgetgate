@@ -103,6 +103,7 @@ class Decision:
     def to_dict(self) -> dict:
         """Serialize for audit composition."""
         return {
+            "schema_version": "0.2.2",
             "status": self.status.name,
             "ledger": str(self.ledger),
             "reason": self.reason.name if self.reason else None,
