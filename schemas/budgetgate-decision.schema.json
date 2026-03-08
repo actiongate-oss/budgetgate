@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://actiongate.dev/schemas/budgetgate-decision-0.2.2.json",
+  "title": "BudgetGate Decision",
+  "description": "Serialized output of budgetgate.Decision.to_dict(). Spend governance evaluation result.",
+  "type": "object",
+  "required": ["schema_version", "status", "ledger", "reason", "message", "spent_in_window", "requested", "remaining"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "0.2.2",
+      "description": "Schema version. Consumers must check this before parsing."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ALLOW", "BLOCK"],
+      "description": "Gate verdict."
+    },
+    "ledger": {
+      "type": "string",
+      "pattern": "^[^:]+:[^@]+@.+$",
+      "description": "Ledger identity as namespace:resource@principal."
+    },
+    "reason": {
+      "type": ["string", "null"],
+      "enum": ["BUDGET_EXCEEDED", "STORE_ERROR", null],
+      "description": "Block reason. Null when status is ALLOW."
+    },
+    "message": {
+      "type": ["string", "null"],
+      "description": "Human-readable explanation. Null when status is ALLOW."
+    },
+    "spent_in_window": {
+      "type": "string",
+      "pattern": "^-?[0-9]+(\\.[0-9]+)?$",
+      "description": "Total spend in current window as decimal string. String preserves arbitrary precision."
+    },
+    "requested": {
+      "type": "string",
+      "pattern": "^-?[0-9]+(\\.[0-9]+)?$",
+      "description": "Requested spend amount as decimal string."
+    },
+    "remaining": {
+      "type": "string",
+      "pattern": "^-?[0-9]+(\\.[0-9]+)?$",
+      "description": "Remaining budget in window as decimal string."
+    }
+  }
+}
