@@ -17,7 +17,7 @@ from .core import (
 )
 from .emitter import Emitter
 from .engine import BudgetExceeded, Engine
-from .store import MemoryStore, Reservation, SpendEvent, Store
+from .store import MemoryStore, RedisStore, Reservation, SpendEvent, Store
 
 __all__ = [
     # Core types
@@ -38,8 +38,9 @@ __all__ = [
     # Store
     "Store",
     "MemoryStore",
+    "RedisStore",
     "SpendEvent",
     "Reservation",
 ]
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"

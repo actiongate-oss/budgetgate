@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "budgetgate"
-version = "0.2.2"
+version = "0.3.0"
 description = "Deterministic, pre-execution spend limiting for semantic actions in agent systems."
 readme = "README.md"
 license = "Apache-2.0"
