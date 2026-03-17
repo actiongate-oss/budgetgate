@@ -49,6 +49,7 @@ packages = ["budgetgate"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+asyncio_mode = "auto"
 
 [tool.mypy]
 python_version = "3.12"

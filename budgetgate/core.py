@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum, auto
-from typing import Optional
 
 
 class Mode(Enum):
@@ -35,7 +34,7 @@ class BlockReason(Enum):
 @dataclass(frozen=True, slots=True)
 class Ledger:
     """Identifies a spend-tracked stream.
-    
+
     Examples:
         Ledger("openai", "gpt-4", "user:123")      # per-user API spend
         Ledger("anthropic", "claude", "team:eng")  # per-team spend
@@ -57,7 +56,7 @@ class Ledger:
 @dataclass(frozen=True, slots=True)
 class Budget:
     """Spend policy.
-    
+
     Args:
         max_spend: Maximum allowed spend in window (Decimal for precision)
         window: Rolling window in seconds (None = unbounded lifetime budget)
@@ -100,7 +99,7 @@ class Decision:
         """Truthy = allowed."""
         return self.allowed
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, object]:
         """Serialize for audit composition."""
         return {
             "schema_version": "0.2.2",
@@ -126,7 +125,7 @@ MISSING = _Missing()
 @dataclass(frozen=True, slots=True)
 class Result[T]:
     """Wrapper for guarded function results.
-    
+
     Uses a sentinel to distinguish between:
     - Function returned None (legitimate value)
     - Function was blocked (no value)

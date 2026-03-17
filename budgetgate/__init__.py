@@ -16,8 +16,16 @@ from .core import (
     StoreErrorMode,
 )
 from .emitter import Emitter
-from .engine import BudgetExceeded, Engine
-from .store import MemoryStore, RedisStore, Reservation, SpendEvent, Store
+from .engine import BudgetExceededError, Engine
+from .store import (
+    AsyncMemoryStore,
+    AsyncStore,
+    MemoryStore,
+    RedisStore,
+    Reservation,
+    SpendEvent,
+    Store,
+)
 
 __all__ = [
     # Core types
@@ -33,11 +41,13 @@ __all__ = [
     "StoreErrorMode",
     # Engine
     "Engine",
-    "BudgetExceeded",
+    "BudgetExceededError",
     "Emitter",
     # Store
     "Store",
+    "AsyncStore",
     "MemoryStore",
+    "AsyncMemoryStore",
     "RedisStore",
     "SpendEvent",
     "Reservation",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import threading
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ from uuid import uuid4
 from .core import Budget, Ledger
 
 if TYPE_CHECKING:
-    from redis import Redis
+    from redis import Redis  # type: ignore[import-not-found]
 
 
 @dataclass(slots=True)
@@ -105,6 +106,59 @@ class Store(Protocol):
         ...
 
 
+class AsyncStore(Protocol):
+    """Async protocol for spend storage backends."""
+
+    async def check_and_reserve(
+        self,
+        ledger: Ledger,
+        now: float,
+        amount: Decimal,
+        budget: Budget,
+    ) -> tuple[Decimal, bool]:
+        """Atomically check budget and reserve spend if allowed."""
+        ...
+
+    async def reserve(
+        self,
+        ledger: Ledger,
+        now: float,
+        amount: Decimal,
+        budget: Budget,
+    ) -> tuple[str | None, Decimal]:
+        """Reserve spend without committing."""
+        ...
+
+    async def commit(
+        self,
+        reservation_id: str,
+        actual: Decimal,
+    ) -> None:
+        """Commit a reservation with actual spend."""
+        ...
+
+    async def release(self, reservation_id: str) -> None:
+        """Release a reservation without committing."""
+        ...
+
+    async def get_spend(
+        self,
+        ledger: Ledger,
+        now: float,
+        window: float | None,
+    ) -> Decimal:
+        """Get current spend in window (read-only)."""
+        ...
+
+    async def clear(self, ledger: Ledger) -> None:
+        """Clear all spend history for a ledger."""
+        ...
+
+    async def clear_all(self) -> None:
+        """Clear all spend history."""
+        ...
+
+
 class MemoryStore:
     """Thread-safe in-memory spend store with reservation support.
 
@@ -149,9 +203,8 @@ class MemoryStore:
         total = Decimal("0")
         cutoff = now - window if window else None
         for res in self._reservations.values():
-            if res.ledger == ledger:
-                if cutoff is None or res.ts >= cutoff:
-                    total += res.amount
+            if res.ledger == ledger and (cutoff is None or res.ts >= cutoff):
+                total += res.amount
         return total
 
     def check_and_reserve(
@@ -246,6 +299,145 @@ class MemoryStore:
 
     def clear_all(self) -> None:
         with self._global_lock:
+            self._ledgers.clear()
+            self._reservations.clear()
+            self._locks.clear()
+
+
+class AsyncMemoryStore:
+    """Async in-memory spend store with reservation support.
+
+    Uses asyncio.Lock for coroutine-safe access. Suitable for
+    single-process async deployments.
+    """
+
+    __slots__ = ("_ledgers", "_reservations", "_locks", "_global_lock")
+
+    def __init__(self) -> None:
+        self._ledgers: dict[Ledger, list[SpendEvent]] = {}
+        self._reservations: dict[str, Reservation] = {}
+        self._locks: dict[Ledger, asyncio.Lock] = {}
+        self._global_lock = asyncio.Lock()
+
+    async def _get_lock(self, ledger: Ledger) -> asyncio.Lock:
+        """Get or create lock for ledger. Must hold _global_lock when calling."""
+        if ledger not in self._locks:
+            self._locks[ledger] = asyncio.Lock()
+        return self._locks[ledger]
+
+    def _prune(
+        self,
+        events: list[SpendEvent],
+        now: float,
+        window: float | None,
+    ) -> list[SpendEvent]:
+        if window is None:
+            return list(events)
+        cutoff = now - window
+        return [e for e in events if e.ts >= cutoff]
+
+    def _get_reserved(
+        self, ledger: Ledger, now: float, window: float | None
+    ) -> Decimal:
+        total = Decimal("0")
+        cutoff = now - window if window else None
+        for res in self._reservations.values():
+            if res.ledger == ledger and (cutoff is None or res.ts >= cutoff):
+                total += res.amount
+        return total
+
+    async def check_and_reserve(
+        self,
+        ledger: Ledger,
+        now: float,
+        amount: Decimal,
+        budget: Budget,
+    ) -> tuple[Decimal, bool]:
+        async with self._global_lock:
+            lock = await self._get_lock(ledger)
+            async with lock:
+                events = self._ledgers.get(ledger, [])
+                pruned = self._prune(events, now, budget.window)
+                committed = sum((e.amount for e in pruned), Decimal("0"))
+                reserved = self._get_reserved(ledger, now, budget.window)
+                current_spend = committed + reserved
+                if current_spend + amount > budget.max_spend:
+                    self._ledgers[ledger] = pruned
+                    return current_spend, False
+                pruned.append(SpendEvent(ts=now, amount=amount))
+                self._ledgers[ledger] = pruned
+                return current_spend + amount, True
+
+    async def reserve(
+        self,
+        ledger: Ledger,
+        now: float,
+        amount: Decimal,
+        budget: Budget,
+    ) -> tuple[str | None, Decimal]:
+        async with self._global_lock:
+            lock = await self._get_lock(ledger)
+            async with lock:
+                events = self._ledgers.get(ledger, [])
+                pruned = self._prune(events, now, budget.window)
+                self._ledgers[ledger] = pruned
+                committed = sum((e.amount for e in pruned), Decimal("0"))
+                reserved = self._get_reserved(ledger, now, budget.window)
+                current_spend = committed + reserved
+                if current_spend + amount > budget.max_spend:
+                    return None, current_spend
+                res_id = uuid4().hex
+                self._reservations[res_id] = Reservation(
+                    id=res_id, ledger=ledger, ts=now, amount=amount,
+                )
+                return res_id, current_spend + amount
+
+    async def commit(self, reservation_id: str, actual: Decimal) -> None:
+        async with self._global_lock:
+            if reservation_id not in self._reservations:
+                raise KeyError(f"Reservation not found: {reservation_id}")
+            res = self._reservations.pop(reservation_id)
+            lock = await self._get_lock(res.ledger)
+            async with lock:
+                events = self._ledgers.get(res.ledger, [])
+                events.append(SpendEvent(ts=res.ts, amount=actual))
+                self._ledgers[res.ledger] = events
+
+    async def release(self, reservation_id: str) -> None:
+        async with self._global_lock:
+            if reservation_id not in self._reservations:
+                raise KeyError(f"Reservation not found: {reservation_id}")
+            del self._reservations[reservation_id]
+
+    async def get_spend(
+        self,
+        ledger: Ledger,
+        now: float,
+        window: float | None,
+    ) -> Decimal:
+        async with self._global_lock:
+            lock = await self._get_lock(ledger)
+            async with lock:
+                events = self._ledgers.get(ledger, [])
+                pruned = self._prune(events, now, window)
+                committed = sum((e.amount for e in pruned), Decimal("0"))
+                reserved = self._get_reserved(ledger, now, window)
+                return committed + reserved
+
+    async def clear(self, ledger: Ledger) -> None:
+        async with self._global_lock:
+            lock = await self._get_lock(ledger)
+            async with lock:
+                self._ledgers.pop(ledger, None)
+                to_remove = [
+                    rid for rid, res in self._reservations.items()
+                    if res.ledger == ledger
+                ]
+                for rid in to_remove:
+                    del self._reservations[rid]
+
+    async def clear_all(self) -> None:
+        async with self._global_lock:
             self._ledgers.clear()
             self._reservations.clear()
             self._locks.clear()
@@ -431,7 +623,7 @@ class RedisStore:
     __slots__ = ("_client", "_prefix", "_s_check", "_s_reserve",
                  "_s_commit", "_s_spend")
 
-    def __init__(self, client: "Redis", prefix: str = "budgetgate") -> None:
+    def __init__(self, client: Redis, prefix: str = "budgetgate") -> None:
         self._client = client
         self._prefix = prefix
         self._s_check = client.register_script(_LUA_CHECK_AND_RESERVE)

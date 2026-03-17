@@ -14,14 +14,14 @@ from decimal import Decimal
 
 sys.path.insert(0, ".")
 from budgetgate import Budget, Ledger
-from budgetgate.store import MemoryStore, SpendEvent
+from budgetgate.store import MemoryStore
 
 passed = 0
 failed = 0
 errors: list[str] = []
 
 
-def test(name):
+def _run_case(name):
     def decorator(fn):
         global passed, failed
         try:
@@ -43,14 +43,14 @@ def run_store_tests(make_store, label):
     ledger = Ledger("openai", "gpt-4", "user:1")
     budget = Budget(max_spend=Decimal("10.00"), window=60.0)
 
-    @test(f"{label}: check_and_reserve allow")
+    @_run_case(f"{label}: check_and_reserve allow")
     def _():
         s = make_store()
         total, ok = s.check_and_reserve(ledger, 1.0, Decimal("3.00"), budget)
         assert ok, f"expected allow, got block (total={total})"
         assert total == Decimal("3.00"), f"expected 3.00, got {total}"
 
-    @test(f"{label}: check_and_reserve block")
+    @_run_case(f"{label}: check_and_reserve block")
     def _():
         s = make_store()
         s.check_and_reserve(ledger, 1.0, Decimal("8.00"), budget)
@@ -58,7 +58,7 @@ def run_store_tests(make_store, label):
         assert not ok, "expected block"
         assert total == Decimal("8.00"), f"expected 8.00, got {total}"
 
-    @test(f"{label}: check_and_reserve window pruning")
+    @_run_case(f"{label}: check_and_reserve window pruning")
     def _():
         s = make_store()
         s.check_and_reserve(ledger, 1.0, Decimal("9.00"), budget)
@@ -66,7 +66,7 @@ def run_store_tests(make_store, label):
         total, ok = s.check_and_reserve(ledger, 63.0, Decimal("5.00"), budget)
         assert ok, f"expected allow after window prune, got block (total={total})"
 
-    @test(f"{label}: reserve and commit")
+    @_run_case(f"{label}: reserve and commit")
     def _():
         s = make_store()
         res_id, total = s.reserve(ledger, 1.0, Decimal("5.00"), budget)
@@ -81,7 +81,7 @@ def run_store_tests(make_store, label):
         total3 = s.get_spend(ledger, 3.0, 60.0)
         assert total3 == Decimal("2.00"), f"expected 2.00 after commit, got {total3}"
 
-    @test(f"{label}: reserve and release")
+    @_run_case(f"{label}: reserve and release")
     def _():
         s = make_store()
         res_id, _ = s.reserve(ledger, 1.0, Decimal("5.00"), budget)
@@ -91,32 +91,32 @@ def run_store_tests(make_store, label):
         total = s.get_spend(ledger, 2.0, 60.0)
         assert total == Decimal("0"), f"expected 0 after release, got {total}"
 
-    @test(f"{label}: reserve block when over budget")
+    @_run_case(f"{label}: reserve block when over budget")
     def _():
         s = make_store()
         s.check_and_reserve(ledger, 1.0, Decimal("8.00"), budget)
         res_id, total = s.reserve(ledger, 2.0, Decimal("3.00"), budget)
         assert res_id is None, "expected block"
 
-    @test(f"{label}: commit unknown raises KeyError")
+    @_run_case(f"{label}: commit unknown raises KeyError")
     def _():
         s = make_store()
         try:
             s.commit("nonexistent", Decimal("1.00"))
-            assert False, "expected KeyError"
+            raise AssertionError("expected KeyError")
         except KeyError:
             pass
 
-    @test(f"{label}: release unknown raises KeyError")
+    @_run_case(f"{label}: release unknown raises KeyError")
     def _():
         s = make_store()
         try:
             s.release("nonexistent")
-            assert False, "expected KeyError"
+            raise AssertionError("expected KeyError")
         except KeyError:
             pass
 
-    @test(f"{label}: get_spend includes reservations")
+    @_run_case(f"{label}: get_spend includes reservations")
     def _():
         s = make_store()
         s.check_and_reserve(ledger, 1.0, Decimal("3.00"), budget)
@@ -124,7 +124,7 @@ def run_store_tests(make_store, label):
         total = s.get_spend(ledger, 3.0, 60.0)
         assert total == Decimal("5.00"), f"expected 5.00, got {total}"
 
-    @test(f"{label}: clear removes spends and reservations")
+    @_run_case(f"{label}: clear removes spends and reservations")
     def _():
         s = make_store()
         s.check_and_reserve(ledger, 1.0, Decimal("5.00"), budget)
@@ -133,7 +133,7 @@ def run_store_tests(make_store, label):
         total = s.get_spend(ledger, 3.0, 60.0)
         assert total == Decimal("0"), f"expected 0 after clear, got {total}"
 
-    @test(f"{label}: clear_all")
+    @_run_case(f"{label}: clear_all")
     def _():
         s = make_store()
         l2 = Ledger("anthropic", "claude", "user:2")
@@ -143,7 +143,7 @@ def run_store_tests(make_store, label):
         assert s.get_spend(ledger, 2.0, 60.0) == Decimal("0")
         assert s.get_spend(l2, 2.0, 60.0) == Decimal("0")
 
-    @test(f"{label}: unbounded window (None)")
+    @_run_case(f"{label}: unbounded window (None)")
     def _():
         unbounded = Budget(max_spend=Decimal("100.00"), window=None)
         s = make_store()
@@ -162,6 +162,7 @@ redis_url = os.environ.get("REDIS_URL")
 if redis_url:
     try:
         import redis
+
         from budgetgate.store import RedisStore
 
         client = redis.Redis.from_url(redis_url, decode_responses=True)
@@ -182,11 +183,12 @@ if redis_url:
 else:
     print("\n  SKIP  RedisStore: set REDIS_URL to enable")
 
-print(f"\n{'═' * 50}")
-print(f"Results: {passed} passed, {failed} failed")
-if errors:
-    print("\nFailures:")
-    for e in errors:
-        print(e)
-print(f"{'═' * 50}")
-sys.exit(1 if failed else 0)
+if __name__ == "__main__":
+    print(f"\n{'═' * 50}")
+    print(f"Results: {passed} passed, {failed} failed")
+    if errors:
+        print("\nFailures:")
+        for e in errors:
+            print(e)
+    print(f"{'═' * 50}")
+    sys.exit(1 if failed else 0)

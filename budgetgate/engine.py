@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable, Coroutine
 from decimal import Decimal
 from functools import wraps
-from typing import Callable, ParamSpec, TypeVar
+from typing import ParamSpec, TypeVar
 
 from .core import (
     BlockReason,
@@ -18,13 +19,13 @@ from .core import (
     StoreErrorMode,
 )
 from .emitter import Emitter
-from .store import MemoryStore, Store
+from .store import AsyncMemoryStore, AsyncStore, MemoryStore, Store
 
 P = ParamSpec("P")
 T = TypeVar("T")
 
 
-class BudgetExceeded(RuntimeError):
+class BudgetExceededError(RuntimeError):
     """Raised when spend would exceed budget in HARD mode."""
 
     def __init__(self, decision: Decision) -> None:
@@ -35,15 +36,17 @@ class BudgetExceeded(RuntimeError):
 class Engine:
     """BudgetGate engine for spend limiting agent actions."""
 
-    __slots__ = ("_store", "_clock", "_budgets", "_emitter")
+    __slots__ = ("_store", "_async_store", "_clock", "_budgets", "_emitter")
 
     def __init__(
         self,
         store: Store | None = None,
         clock: Callable[[], float] | None = None,
         emitter: Emitter | None = None,
+        async_store: AsyncStore | None = None,
     ) -> None:
         self._store: Store = store or MemoryStore()
+        self._async_store: AsyncStore = async_store or AsyncMemoryStore()
         self._clock = clock or time.monotonic
         self._budgets: dict[Ledger, Budget] = {}
         self._emitter = emitter or Emitter()
@@ -69,39 +72,68 @@ class Engine:
     # Core API
     # ─────────────────────────────────────────────────────────────
 
-    def check(self, ledger: Ledger, amount: Decimal, budget: Budget | None = None) -> Decision:
+    def check(
+        self, ledger: Ledger, amount: Decimal, budget: Budget | None = None,
+    ) -> Decision:
         now = self._clock()
         budget = budget or self.budget_for(ledger)
         try:
-            total_spent, allowed = self._store.check_and_reserve(ledger, now, amount, budget)
+            total_spent, allowed = self._store.check_and_reserve(
+                ledger, now, amount, budget,
+            )
         except Exception as e:
             return self._handle_store_error(ledger, budget, amount, e)
         if allowed:
             remaining = max(Decimal("0"), budget.max_spend - total_spent)
-            return self._decide(ledger, budget, amount, status=Status.ALLOW,
-                                spent_in_window=total_spent, remaining=remaining)
+            return self._decide(
+                ledger, budget, amount, status=Status.ALLOW,
+                spent_in_window=total_spent, remaining=remaining,
+            )
         remaining = max(Decimal("0"), budget.max_spend - total_spent)
-        return self._decide(ledger, budget, amount, status=Status.BLOCK,
-                            reason=BlockReason.BUDGET_EXCEEDED,
-                            message=f"Budget exceeded: {total_spent} + {amount} > {budget.max_spend}",
-                            spent_in_window=total_spent, remaining=remaining)
+        msg = (
+            f"Budget exceeded: {total_spent} + {amount}"
+            f" > {budget.max_spend}"
+        )
+        return self._decide(
+            ledger, budget, amount, status=Status.BLOCK,
+            reason=BlockReason.BUDGET_EXCEEDED,
+            message=msg,
+            spent_in_window=total_spent, remaining=remaining,
+        )
 
-    def reserve(self, ledger: Ledger, estimate: Decimal, budget: Budget | None = None) -> tuple[str | None, Decision]:
+    def reserve(
+        self,
+        ledger: Ledger,
+        estimate: Decimal,
+        budget: Budget | None = None,
+    ) -> tuple[str | None, Decision]:
         now = self._clock()
         budget = budget or self.budget_for(ledger)
         try:
-            res_id, total_spent = self._store.reserve(ledger, now, estimate, budget)
+            res_id, total_spent = self._store.reserve(
+                ledger, now, estimate, budget,
+            )
         except Exception as e:
-            return None, self._handle_store_error(ledger, budget, estimate, e)
+            return None, self._handle_store_error(
+                ledger, budget, estimate, e,
+            )
         if res_id is not None:
             remaining = max(Decimal("0"), budget.max_spend - total_spent)
-            return res_id, self._decide(ledger, budget, estimate, status=Status.ALLOW,
-                                        spent_in_window=total_spent, remaining=remaining)
+            return res_id, self._decide(
+                ledger, budget, estimate, status=Status.ALLOW,
+                spent_in_window=total_spent, remaining=remaining,
+            )
         remaining = max(Decimal("0"), budget.max_spend - total_spent)
-        return None, self._decide(ledger, budget, estimate, status=Status.BLOCK,
-                                  reason=BlockReason.BUDGET_EXCEEDED,
-                                  message=f"Budget exceeded: {total_spent} + {estimate} > {budget.max_spend}",
-                                  spent_in_window=total_spent, remaining=remaining)
+        msg = (
+            f"Budget exceeded: {total_spent} + {estimate}"
+            f" > {budget.max_spend}"
+        )
+        return None, self._decide(
+            ledger, budget, estimate, status=Status.BLOCK,
+            reason=BlockReason.BUDGET_EXCEEDED,
+            message=msg,
+            spent_in_window=total_spent, remaining=remaining,
+        )
 
     def commit(self, reservation_id: str, actual: Decimal) -> None:
         self._store.commit(reservation_id, actual)
@@ -111,7 +143,7 @@ class Engine:
 
     def enforce(self, decision: Decision) -> None:
         if decision.blocked and decision.budget.mode == Mode.HARD:
-            raise BudgetExceeded(decision)
+            raise BudgetExceededError(decision)
 
     def get_remaining(self, ledger: Ledger, budget: Budget | None = None) -> Decimal:
         now = self._clock()
@@ -129,7 +161,9 @@ class Engine:
     # Decorator API
     # ─────────────────────────────────────────────────────────────
 
-    def guard(self, ledger: Ledger, budget: Budget | None = None, *, cost: Decimal) -> Callable[[Callable[P, T]], Callable[P, T]]:
+    def guard(
+        self, ledger: Ledger, budget: Budget | None = None, *, cost: Decimal,
+    ) -> Callable[[Callable[P, T]], Callable[P, T]]:
         if budget is not None:
             self.register(ledger, budget)
         def decorator(fn: Callable[P, T]) -> Callable[P, T]:
@@ -137,12 +171,19 @@ class Engine:
             def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
                 decision = self.check(ledger, cost)
                 if decision.blocked:
-                    raise BudgetExceeded(decision)
+                    raise BudgetExceededError(decision)
                 return fn(*args, **kwargs)
             return wrapper
         return decorator
 
-    def guard_bounded(self, ledger: Ledger, budget: Budget | None = None, *, estimate: Decimal, actual: Callable[[T], Decimal]) -> Callable[[Callable[P, T]], Callable[P, T]]:
+    def guard_bounded(
+        self,
+        ledger: Ledger,
+        budget: Budget | None = None,
+        *,
+        estimate: Decimal,
+        actual: Callable[[T], Decimal],
+    ) -> Callable[[Callable[P, T]], Callable[P, T]]:
         if budget is not None:
             self.register(ledger, budget)
         def decorator(fn: Callable[P, T]) -> Callable[P, T]:
@@ -150,13 +191,13 @@ class Engine:
             def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
                 res_id, decision = self.reserve(ledger, estimate)
                 if decision.blocked:
-                    raise BudgetExceeded(decision)
+                    raise BudgetExceededError(decision)
                 try:
                     result = fn(*args, **kwargs)
                     actual_cost = actual(result)
                     self.commit(res_id, actual_cost)  # type: ignore[arg-type]
                     return result
-                except BudgetExceeded:
+                except BudgetExceededError:
                     raise
                 except Exception:
                     if res_id is not None:
@@ -165,7 +206,9 @@ class Engine:
             return wrapper
         return decorator
 
-    def guard_result(self, ledger: Ledger, budget: Budget | None = None, *, cost: Decimal) -> Callable[[Callable[P, T]], Callable[P, Result[T]]]:
+    def guard_result(
+        self, ledger: Ledger, budget: Budget | None = None, *, cost: Decimal,
+    ) -> Callable[[Callable[P, T]], Callable[P, Result[T]]]:
         if budget is not None:
             self.register(ledger, budget)
         def decorator(fn: Callable[P, T]) -> Callable[P, Result[T]]:
@@ -179,7 +222,14 @@ class Engine:
             return wrapper
         return decorator
 
-    def guard_bounded_result(self, ledger: Ledger, budget: Budget | None = None, *, estimate: Decimal, actual: Callable[[T], Decimal]) -> Callable[[Callable[P, T]], Callable[P, Result[T]]]:
+    def guard_bounded_result(
+        self,
+        ledger: Ledger,
+        budget: Budget | None = None,
+        *,
+        estimate: Decimal,
+        actual: Callable[[T], Decimal],
+    ) -> Callable[[Callable[P, T]], Callable[P, Result[T]]]:
         if budget is not None:
             self.register(ledger, budget)
         def decorator(fn: Callable[P, T]) -> Callable[P, Result[T]]:
@@ -201,22 +251,133 @@ class Engine:
         return decorator
 
     # ─────────────────────────────────────────────────────────────
+    # Async API
+    # ─────────────────────────────────────────────────────────────
+
+    async def async_check(
+        self, ledger: Ledger, amount: Decimal, budget: Budget | None = None
+    ) -> Decision:
+        """Async version of check(). Uses async_store backend."""
+        now = self._clock()
+        budget = budget or self.budget_for(ledger)
+        try:
+            total_spent, allowed = await self._async_store.check_and_reserve(
+                ledger, now, amount, budget
+            )
+        except Exception as e:
+            return self._handle_store_error(ledger, budget, amount, e)
+        if allowed:
+            remaining = max(Decimal("0"), budget.max_spend - total_spent)
+            return self._decide(
+                ledger, budget, amount, status=Status.ALLOW,
+                spent_in_window=total_spent, remaining=remaining,
+            )
+        remaining = max(Decimal("0"), budget.max_spend - total_spent)
+        return self._decide(
+            ledger, budget, amount, status=Status.BLOCK,
+            reason=BlockReason.BUDGET_EXCEEDED,
+            message=f"Budget exceeded: {total_spent} + {amount} > {budget.max_spend}",
+            spent_in_window=total_spent, remaining=remaining,
+        )
+
+    async def async_enforce(self, decision: Decision) -> None:
+        """Async version of enforce(). Raises BudgetExceededError in HARD mode."""
+        if decision.blocked and decision.budget.mode == Mode.HARD:
+            raise BudgetExceededError(decision)
+
+    def async_guard(
+        self,
+        ledger: Ledger,
+        budget: Budget | None = None,
+        *,
+        cost: Decimal,
+    ) -> Callable[
+        [Callable[P, Coroutine[object, object, T]]],
+        Callable[P, Coroutine[object, object, T]],
+    ]:
+        """Async decorator that returns T directly. Raises BudgetExceededError on limit."""
+        if budget is not None:
+            self.register(ledger, budget)
+
+        def decorator(
+            fn: Callable[P, Coroutine[object, object, T]],
+        ) -> Callable[P, Coroutine[object, object, T]]:
+            @wraps(fn)
+            async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+                decision = await self.async_check(ledger, cost)
+                if decision.blocked:
+                    raise BudgetExceededError(decision)
+                return await fn(*args, **kwargs)
+            return wrapper
+        return decorator
+
+    def async_guard_result(
+        self,
+        ledger: Ledger,
+        budget: Budget | None = None,
+        *,
+        cost: Decimal,
+    ) -> Callable[
+        [Callable[P, Coroutine[object, object, T]]],
+        Callable[P, Coroutine[object, object, Result[T]]],
+    ]:
+        """Async decorator that returns Result[T] (never raises)."""
+        if budget is not None:
+            self.register(ledger, budget)
+
+        def decorator(
+            fn: Callable[P, Coroutine[object, object, T]],
+        ) -> Callable[P, Coroutine[object, object, Result[T]]]:
+            @wraps(fn)
+            async def wrapper(*args: P.args, **kwargs: P.kwargs) -> Result[T]:
+                decision = await self.async_check(ledger, cost)
+                if decision.blocked:
+                    return Result(decision=decision)
+                value = await fn(*args, **kwargs)
+                return Result(decision=decision, _value=value)
+            return wrapper
+        return decorator
+
+    # ─────────────────────────────────────────────────────────────
     # Internal
     # ─────────────────────────────────────────────────────────────
 
-    def _handle_store_error(self, ledger: Ledger, budget: Budget, amount: Decimal, error: Exception) -> Decision:
+    def _handle_store_error(
+        self,
+        ledger: Ledger,
+        budget: Budget,
+        amount: Decimal,
+        error: Exception,
+    ) -> Decision:
         if budget.on_store_error == StoreErrorMode.FAIL_OPEN:
-            return self._decide(ledger, budget, amount, status=Status.ALLOW,
-                                reason=BlockReason.STORE_ERROR, message=f"Store error (fail-open): {error}")
-        else:
-            return self._decide(ledger, budget, amount, status=Status.BLOCK,
-                                reason=BlockReason.STORE_ERROR, message=f"Store error (fail-closed): {error}")
+            return self._decide(
+                ledger, budget, amount, status=Status.ALLOW,
+                reason=BlockReason.STORE_ERROR,
+                message=f"Store error (fail-open): {error}",
+            )
+        return self._decide(
+            ledger, budget, amount, status=Status.BLOCK,
+            reason=BlockReason.STORE_ERROR,
+            message=f"Store error (fail-closed): {error}",
+        )
 
-    def _decide(self, ledger: Ledger, budget: Budget, amount: Decimal, *, status: Status,
-                reason: BlockReason | None = None, message: str | None = None,
-                spent_in_window: Decimal = Decimal("0"), remaining: Decimal = Decimal("0")) -> Decision:
-        decision = Decision(status=status, ledger=ledger, budget=budget, reason=reason,
-                            message=message, spent_in_window=spent_in_window,
-                            requested=amount, remaining=remaining)
+    def _decide(
+        self,
+        ledger: Ledger,
+        budget: Budget,
+        amount: Decimal,
+        *,
+        status: Status,
+        reason: BlockReason | None = None,
+        message: str | None = None,
+        spent_in_window: Decimal = Decimal("0"),
+        remaining: Decimal = Decimal("0"),
+    ) -> Decision:
+        decision = Decision(
+            status=status, ledger=ledger, budget=budget,
+            reason=reason, message=message,
+            spent_in_window=spent_in_window,
+            requested=amount, remaining=remaining,
+        )
         self._emitter.emit(decision)
         return decision
